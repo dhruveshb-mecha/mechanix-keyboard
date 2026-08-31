@@ -1,0 +1,29 @@
+name: mechanix-keyboard
+arch: "${PKG_ARCH}"
+platform: linux
+version: "${PKG_VERSION}"
+release: "${PKG_RELEASE}"
+section: utils
+priority: optional
+maintainer: "Ayaskant Panigrahi <ayaskantp@mechasystems.com>, Naman Agrawal <namana@mechasystems.com>, Shoaib Merchant <shoaibm@mechasystems.com>"
+description: Onscreen Keyboard (OSK) for Mechanix OS
+homepage: https://github.com/mecha-org/mechanix-keyboard.git
+license: BSD
+
+overrides:
+  rpm:
+    depends:
+      - libxkbcommon
+      - mesa-libgbm
+      - libdrm
+  deb:
+    depends:
+      - libxkbcommon0
+      - libgbm1
+      - libdrm2
+
+contents:
+  - src: ./target/aarch64-unknown-linux-gnu/release/mechanix-keyboard
+    dst: /usr/bin/mechanix-keyboard
+    file_info:
+      mode: 0755

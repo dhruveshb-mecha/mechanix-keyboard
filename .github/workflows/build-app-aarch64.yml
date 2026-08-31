@@ -1,0 +1,175 @@
+name: Build Keyboard aarch64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - dev
+      - pre-release
+      - build*
+    paths:
+      - ".github/workflows/build-app-aarch64.yml"
+      - "packaging/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "resources/**"
+      - "config.toml"
+      - "build.rs"
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  MECHA_PULP_USERNAME: ${{ secrets.MECHA_PULP_USERNAME }}
+  MECHA_PULP_PASSWORD: ${{ secrets.MECHA_PULP_PASSWORD }}
+  MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+  MECHA_PULP_RPMS_REPOSITORY_NAME: ${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}
+  MECHA_PULP_DEBS_REPOSITORY_NAME: ${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}
+
+jobs:
+  build:
+    name: mechanix-keyboard
+    runs-on: ubuntu-24.04-arm
+    environment: pre-release
+    continue-on-error: true
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git tar unzip curl clang cmake pkg-config \
+            libxkbcommon-dev libgbm-dev libdrm-dev \
+            build-essential jq pipx
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          target: aarch64-unknown-linux-gnu
+
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.47.0
+        run: |
+          curl -fsSL -o nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_arm64.deb"
+          sudo dpkg -i nfpm.deb
+          rm nfpm.deb
+
+      - name: Install mechanix-packager
+        env:
+          MECHANIX_PACKAGER_VERSION: v0.0.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/mechanix-packager"
+          curl -fsSL "https://github.com/mecha-org/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
+          echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build keyboard
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Resolve versions
+        id: version
+        run: |
+          set -euo pipefail
+          RPM_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format rpm) || { echo "[ERROR] rpm version resolution failed"; exit 1; }
+          DEB_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format deb) || { echo "[ERROR] deb version resolution failed"; exit 1; }
+          echo "rpm_release=$(echo "$RPM_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+          echo "deb_release=$(echo "$DEB_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+
+      - name: Package RPM
+        run: |
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats rpm --release "${{ steps.version.outputs.rpm_release }}"
+
+      - name: Package DEB
+        run: |
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats deb --release "${{ steps.version.outputs.deb_release }}"
+
+      - name: Check package sizes
+        run: |
+          for EXT in rpm deb; do
+            FILE=$(find ./dist -name "mechanix-keyboard*.${EXT}" -type f | head -n1)
+
+            if [ -f "$FILE" ]; then
+              SIZE_MB=$(( $(stat -c%s "$FILE") / 1048576 ))
+              echo "$EXT size: $SIZE_MB MB"
+              if [ "$SIZE_MB" -lt 1 ]; then
+                echo "$EXT file too small: $SIZE_MB MB"
+                exit 1
+              fi
+            else
+              echo "$EXT file not found"
+              exit 1
+            fi
+          done
+
+      - name: Setup | Pulp CLI
+        run: |
+          pipx install --force "pulp-cli==0.39.3"
+          pipx inject pulp-cli pulp-cli-deb pulp_rpm
+
+      - name: Configure Pulp CLI
+        run: |
+          set -euo pipefail
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+          if [ -z "$PULP_API_URL" ]; then
+            echo "MECHA_PULP_API_URL is empty after trimming whitespace"
+            exit 1
+          fi
+
+          pulp config create \
+            --username "$MECHA_PULP_USERNAME" \
+            --password "$MECHA_PULP_PASSWORD" \
+            --base-url "$PULP_API_URL" \
+            --overwrite
+
+      - name: Publish RPM
+        continue-on-error: true
+        run: |
+          RPM_FILE=$(find ./dist -name "mechanix-keyboard*.rpm" -type f | head -n1)
+          echo "[INFO] Publishing RPM: $RPM_FILE"
+
+          pulp rpm content upload --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" --file="$RPM_FILE"
+
+          PUB_HREF=$(pulp rpm publication create \
+            --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
+
+          pulp rpm distribution update \
+            --name="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" \
+            --base-path="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" \
+            --publication="$PUB_HREF"
+
+      - name: Publish DEB
+        continue-on-error: true
+        run: |
+          DEB_FILE=$(find ./dist -name "mechanix-keyboard*.deb" -type f | head -n1)
+          echo "[INFO] Publishing DEB: $DEB_FILE"
+
+          pulp deb content upload --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" --file="$DEB_FILE"
+
+          PUB_HREF=$(pulp deb publication create \
+            --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
+
+          pulp deb distribution update \
+            --name="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" \
+            --base-path="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" \
+            --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}"
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mechanix-keyboard
+          path: |
+            ./target/aarch64-unknown-linux-gnu/release/mechanix-keyboard
+            ./dist/*.rpm
+            ./dist/*.deb

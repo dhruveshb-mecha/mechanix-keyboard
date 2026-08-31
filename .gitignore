@@ -4,6 +4,10 @@ debug
 target
 result
 
+# mechanix-packager output
+/dist/
+/stage/
+
 
 docs
 .direnv
