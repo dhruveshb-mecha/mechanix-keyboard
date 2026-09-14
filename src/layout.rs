@@ -1,6 +1,6 @@
 use assets::SpriteRegion;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::{env, fs};
 use tracing::{info, warn};
 use utils::Rect;
@@ -10,10 +10,10 @@ use crate::{MechanixKeyboardState, icons};
 
 #[derive(Debug, Deserialize)]
 struct Layout {
-    outlines: BTreeMap<String, Outline>,
-    views: BTreeMap<String, Vec<String>>,
+    outlines: HashMap<String, Outline>,
+    views: HashMap<String, Vec<String>>,
     #[serde(default)]
-    buttons: BTreeMap<String, Button>,
+    buttons: HashMap<String, Button>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

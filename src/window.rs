@@ -1,10 +1,9 @@
-use interactivity::pointer::MouseButton;
-use utils::{Point, Rect};
+use utils::Rect;
 use wayland::*;
 
-use crate::layout::{KeyAction, View};
+use crate::MechanixKeyboardState;
+use crate::layout::View;
 use crate::render;
-use crate::{MechanixKeyboardState, virtual_keyboard};
 
 /// Height in logical px of the Handle — the full-width band at the bottom edge,
 /// always drawn, whose tap toggles Bar visibility. It is the bar's entire height
@@ -17,12 +16,6 @@ pub struct WaylandGlobals {
     pub output: Option<Handle<WlOutput>>,
     pub layer_shell: Option<Handle<ZwlrLayerShellV1>>,
     pub dmabuf: Option<Handle<ZwpLinuxDmabufV1>>,
-    pub seat: Option<Handle<WlSeat>>,
-    pub pointer: Option<Handle<WlPointer>>,
-    pub keyboard: Option<Handle<WlKeyboard>>,
-    pub touch: Option<Handle<WlTouch>>,
-    pub virtual_keyboard_manager: Option<Handle<ZwpVirtualKeyboardManagerV1>>,
-    pub virtual_keyboard: Option<Handle<ZwpVirtualKeyboardV1>>,
 }
 
 pub struct WindowState {
@@ -74,30 +67,7 @@ fn on_registry(s: &mut MechanixKeyboardState, event: &WlRegistryEvent) {
         ZwlrLayerShellV1::NAME => s.globals.layer_shell = Some(sender.bind(*name, *version)),
         WlOutput::NAME => s.globals.output = Some(sender.bind(*name, *version)),
         ZwpLinuxDmabufV1::NAME => s.globals.dmabuf = Some(sender.bind(*name, *version)),
-        WlSeat::NAME => s.globals.seat = Some(sender.bind(*name, *version)),
-        ZwpVirtualKeyboardManagerV1::NAME => {
-            s.globals.virtual_keyboard_manager = Some(sender.bind(*name, *version))
-        }
         _ => {}
-    }
-}
-
-/// Bind keyboard/pointer/touch as the seat reports having them.
-fn on_seat(s: &mut MechanixKeyboardState, event: &WlSeatEvent) {
-    let WlSeatEvent::Capabilities { capabilities, .. } = event else {
-        return;
-    };
-    let Some(seat) = s.globals.seat.clone() else {
-        return;
-    };
-    if capabilities.contains(WlSeatCapability::Keyboard) && s.globals.keyboard.is_none() {
-        s.globals.keyboard = Some(seat.get_keyboard());
-    }
-    if capabilities.contains(WlSeatCapability::Pointer) && s.globals.pointer.is_none() {
-        s.globals.pointer = Some(seat.get_pointer());
-    }
-    if capabilities.contains(WlSeatCapability::Touch) && s.globals.touch.is_none() {
-        s.globals.touch = Some(seat.get_touch());
     }
 }
 
@@ -292,166 +262,12 @@ fn on_buffer_release(s: &mut MechanixKeyboardState, event: &WlBufferEvent) {
     }
 }
 
-// ── input → interactivity ──────────────────────────────────────────────────
-
-fn on_keyboard(s: &mut MechanixKeyboardState, event: &WlKeyboardEvent) {
-    s.interactivity.call_before_frame();
-    s.interactivity.process_keyboard(event);
-    tracing::debug!(
-        just_pressed = ?s.interactivity.keyboard.just_pressed_keys(),
-        just_released = ?s.interactivity.keyboard.just_released_keys(),
-        modifiers = ?s.interactivity.keyboard.modifiers(),
-        "keyboard input",
-    );
-}
-
-fn on_pointer(s: &mut MechanixKeyboardState, event: &WlPointerEvent) {
-    s.interactivity.call_before_frame();
-    s.interactivity.process_pointer(event);
-
-    // Copy the surface-local points out before the keymap borrow, so the
-    // interactivity borrow is released for the hit-test below.
-    let position = s.interactivity.pointer.position();
-    let pressed = s
-        .interactivity
-        .pointer
-        .just_pressed_position(MouseButton::Left)
-        .copied();
-
-    // A click on the Handle toggles Bar visibility, in either state. The Handle
-    // sits below the keys, so it never overlaps a key's touch area.
-    if let Some(hr) = handle_rect(s) {
-        if pressed.is_some_and(|p| hr.contains_point(p)) {
-            toggle_visibility(s);
-            return;
-        }
-    }
-
-    // Keys are only live while shown; when hidden, clear any stale hover.
-    if !s.window.as_ref().is_some_and(|w| w.visible) {
-        if s.last_hover.take().is_some() {
-            tracing::info!("hover: none");
-        }
-        return;
-    }
-
-    // Resolve the hover label and the clicked key's action while the keymap is
-    // borrowed, then act after the borrow ends (emitting needs `&mut s`).
-    let (hover, clicked) = {
-        let Some((view, f)) = view_and_factor(s) else {
-            return;
-        };
-        let hover = key_at(view, f, position);
-        let clicked = pressed.and_then(|p| action_at(view, f, p));
-        (hover, clicked)
-    };
-
-    // Click: type the key the left button went down on this frame.
-    if let Some(action) = clicked {
-        dispatch_action(s, &action);
-    }
-
-    // Hover: print only when the key under the pointer changes.
-    if hover != s.last_hover {
-        match &hover {
-            Some(label) => tracing::info!(key = %label, "hover"),
-            None => tracing::info!("hover: none"),
-        }
-        s.last_hover = hover;
-    }
-}
-
-fn on_touch(s: &mut MechanixKeyboardState, event: &WlTouchEvent) {
-    s.interactivity.call_before_frame();
-    s.interactivity.process_touch(event);
-
-    // A tap on the Handle toggles Bar visibility, in either state. Check it
-    // first; the Handle sits below the keys, so it never overlaps a key.
-    if let Some(hr) = handle_rect(s) {
-        if s.interactivity.touch.tapped(hr) {
-            toggle_visibility(s);
-            return;
-        }
-    }
-
-    // Keys are only live while shown.
-    if !s.window.as_ref().is_some_and(|w| w.visible) {
-        return;
-    }
-
-    // Probe each key's touch area for a tap that landed and completed this frame,
-    // cloning the tapped key's action out so the keymap borrow ends before we
-    // emit (which needs `&mut s`).
-    let tapped = {
-        let Some((view, f)) = view_and_factor(s) else {
-            return;
-        };
-        view.keys()
-            .find(|key| s.interactivity.touch.tapped(scale_rect(key.touch_area, f)))
-            .map(|key| key.action.clone())
-    };
-
-    if let Some(action) = tapped {
-        dispatch_action(s, &action);
-    }
-}
-
-/// Route a tapped key's action. A view switch mutates the Current view; a
-/// modifier latch arms/disarms; both repaint here. Every other action is a
-/// keystroke the virtual keyboard emits (which also repaints if it consumes a
-/// latch, so the armed highlight clears).
-fn dispatch_action(s: &mut MechanixKeyboardState, action: &KeyAction) {
-    let target = match action {
-        KeyAction::SetView(name) => name.as_str(),
-        KeyAction::ToggleView { lock, unlock } => {
-            // Toggle by current view: if the lock view is already showing, go
-            // back to `unlock`; otherwise switch to `lock`.
-            let current = s.current_view().map(|v| v.name.as_str());
-            if current == Some(lock.as_str()) {
-                unlock.as_str()
-            } else {
-                lock.as_str()
-            }
-        }
-        KeyAction::LatchModifier(name) => {
-            // Arm/disarm the modifier and repaint so its key shows the change.
-            virtual_keyboard::toggle_latch(s, name);
-            render::render(s);
-            return;
-        }
-        _ => {
-            // Emit; if a latch was armed, it's now consumed, so repaint to drop
-            // the highlight. Compare the armed count across the emit.
-            let armed_before = s.virtual_keyboard_state.latched.len();
-            virtual_keyboard::emit_action(s, action);
-            if s.virtual_keyboard_state.latched.len() != armed_before {
-                render::render(s);
-            }
-            return;
-        }
-    };
-    switch_view(s, target);
-}
-
-/// Switch the Current view to the named one and repaint. A no-op (no repaint) if
-/// the name is unknown or already current.
-fn switch_view(s: &mut MechanixKeyboardState, name: &str) {
-    let Some(idx) = s.keymap.as_ref().and_then(|km| km.index_of(name)) else {
-        tracing::warn!(view = %name, "view switch to unknown view; ignored");
-        return;
-    };
-    if idx == s.current_view {
-        return;
-    }
-    s.current_view = idx;
-    tracing::info!(view = %name, "switched view");
-    render::render(s);
-}
+// ── window interactivity helpers ──────────────────────────────────────────────────
 
 /// The Handle's rect in surface-local coordinates: the bottom `HANDLE_HEIGHT`
 /// band, full width. `None` until the surface size is known. When hidden the
 /// bar is only this tall, so the Handle is the whole surface.
-fn handle_rect(s: &MechanixKeyboardState) -> Option<Rect> {
+pub(crate) fn handle_rect(s: &MechanixKeyboardState) -> Option<Rect> {
     let window = s.window.as_ref()?;
     if window.logical_width == 0 || window.logical_height == 0 {
         return None;
@@ -467,7 +283,7 @@ fn handle_rect(s: &MechanixKeyboardState) -> Option<Rect> {
 
 /// Flip Bar visibility and re-request the matching bar height. The resulting
 /// `Configure` reallocates slots at the new size and repaints.
-fn toggle_visibility(s: &mut MechanixKeyboardState) {
+pub(crate) fn toggle_visibility(s: &mut MechanixKeyboardState) {
     let logical_w = match s.window.as_ref() {
         Some(w) if w.logical_width > 0 => w.logical_width,
         _ => return,
@@ -492,7 +308,7 @@ fn toggle_visibility(s: &mut MechanixKeyboardState) {
 /// The rendered view and the factor mapping its logical layout units onto
 /// surface-local (input) coordinates: `f = logical_width / view_width`. Returns
 /// `None` until the keymap and surface width are known.
-fn view_and_factor(s: &MechanixKeyboardState) -> Option<(&View, f32)> {
+pub(crate) fn view_and_factor(s: &MechanixKeyboardState) -> Option<(&View, f32)> {
     let view = s.current_view()?;
     let view_w = view.width();
     let logical_w = s.window.as_ref()?.logical_width;
@@ -502,22 +318,8 @@ fn view_and_factor(s: &MechanixKeyboardState) -> Option<(&View, f32)> {
     Some((view, logical_w as f32 / view_w))
 }
 
-/// Label of the first key whose (scaled) touch area contains `p`, else `None`.
-fn key_at(view: &View, f: f32, p: Point) -> Option<String> {
-    view.keys()
-        .find(|k| scale_rect(k.touch_area, f).contains_point(p))
-        .map(|k| k.display_label().to_string())
-}
-
-/// Action of the first key whose (scaled) touch area contains `p`, cloned.
-fn action_at(view: &View, f: f32, p: Point) -> Option<KeyAction> {
-    view.keys()
-        .find(|k| scale_rect(k.touch_area, f).contains_point(p))
-        .map(|k| k.action.clone())
-}
-
 /// Scale a layout-unit rect into surface-local coordinates.
-fn scale_rect(r: Rect, f: f32) -> Rect {
+pub(crate) fn scale_rect(r: Rect, f: f32) -> Rect {
     Rect::new(r.x() * f, r.y() * f, r.width() * f, r.height() * f)
 }
 
@@ -526,12 +328,8 @@ pub fn module<S>() -> impl app::RegisteredModule<MechanixKeyboardState, S> {
         .on(on_start)
         .on(on_pre_poll)
         .on(on_registry)
-        .on(on_seat)
         .on(on_output)
         .on(on_callback)
         .on(on_configure)
         .on(on_buffer_release)
-        .on(on_keyboard)
-        .on(on_pointer)
-        .on(on_touch)
 }

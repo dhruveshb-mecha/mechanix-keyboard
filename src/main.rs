@@ -1,8 +1,5 @@
 #![recursion_limit = "1024"]
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use std::collections::HashSet;
 
 use app::prelude::*;
 use interactivity::InteractivityState;
