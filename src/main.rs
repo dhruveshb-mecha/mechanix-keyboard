@@ -7,6 +7,7 @@ use io_ring::Ring;
 use renderer::{Renderer, TextureId};
 use wayland::*;
 
+mod input_method;
 mod layout;
 mod render;
 mod virtual_keyboard;
@@ -62,6 +63,8 @@ pub struct MechanixKeyboardState {
     last_hover: Option<String>,
     #[lens(skip)]
     virtual_keyboard_state: VirtualKeyboardState,
+    #[lens(skip)]
+    input_method_state: crate::input_method::InputMethodState,
 }
 
 impl MechanixKeyboardState {
@@ -83,6 +86,7 @@ impl MechanixKeyboardState {
             scale: 1,
             last_hover: None,
             virtual_keyboard_state: VirtualKeyboardState::new(),
+            input_method_state: crate::input_method::InputMethodState::new(),
         }
     }
 
@@ -108,7 +112,8 @@ fn main() {
         .mount(render::module())
         .mount(window::module())
         .mount(layout::module())
-        .mount(virtual_keyboard::module());
+        .mount(virtual_keyboard::module())
+        .mount(input_method::module());
 
     app.dispatch(&app::Start);
     loop {

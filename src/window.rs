@@ -281,9 +281,21 @@ pub(crate) fn handle_rect(s: &MechanixKeyboardState) -> Option<Rect> {
     ))
 }
 
-/// Flip Bar visibility and re-request the matching bar height. The resulting
+/// Flip keyboard visibility and re-request the matching bar height. The resulting
 /// `Configure` reallocates slots at the new size and repaints.
 pub(crate) fn toggle_visibility(s: &mut MechanixKeyboardState) {
+    let visible = s.window.as_mut().expect("window exists").visible;
+    set_visibility(s, !visible);
+    tracing::info!("toggled keyboard visibility");
+}
+
+/// Sets keyboard window visibility
+pub(crate) fn set_visibility(s: &mut MechanixKeyboardState, visible: bool) {
+    if let Some(window) = &s.window
+        && window.visible == visible
+    {
+        return;
+    }
     let logical_w = match s.window.as_ref() {
         Some(w) if w.logical_width > 0 => w.logical_width,
         _ => return,
@@ -293,7 +305,7 @@ pub(crate) fn toggle_visibility(s: &mut MechanixKeyboardState) {
         _ => return,
     };
     let window = s.window.as_mut().expect("window exists");
-    window.visible = !window.visible;
+    window.visible = visible;
     let target = if window.visible {
         (view_h * logical_w as f32 / view_w).round() as u32 + HANDLE_HEIGHT
     } else {
@@ -302,7 +314,11 @@ pub(crate) fn toggle_visibility(s: &mut MechanixKeyboardState) {
     window.requested_height = target;
     window.layer_surface.set_size(0, target);
     window.surface.commit();
-    tracing::info!(visible = window.visible, target, "toggled bar visibility");
+    tracing::info!(
+        visible = window.visible,
+        target,
+        "toggled keyboard visibility"
+    );
 }
 
 /// The rendered view and the factor mapping its logical layout units onto

@@ -390,14 +390,34 @@ fn scan_keycodes(keymap: &Keymap) -> HashMap<Keysym, Keystroke> {
 pub fn emit_action(s: &mut MechanixKeyboardState, action: &KeyAction) {
     match action {
         KeyAction::EmitKeysym(ks) => {
-            emit_keysym(s, *ks);
-            consume_latch(s);
+            // Printable keysyms commit via IM2; control keysyms (BackSpace,
+            // Return, …) fall back to the virtual-keyboard-v1 keysym transport,
+            // since committing `keysym_get_name` would literally type "BackSpace".
+            if let Some(text) = keysym_text(*ks)
+                && crate::input_method::commit_text(s, &text)
+            {
+                tracing::info!(input = %text, "input method");
+                consume_latch(s);
+            } else {
+                emit_keysym(s, *ks);
+                consume_latch(s);
+            }
         }
         KeyAction::EmitText(text) => {
-            for ch in text.chars() {
-                emit_keysym(s, Keysym::from_char(ch));
+            // When a text input is focused, the compositor has activated IM2;
+            // commit the run as one `commit_string` — the idiomatic IM2 text
+            // path — rather than synthesising a keysym per character. Falls back
+            // to the virtual-keyboard-v1 keysym transport when no text input is
+            // focused (IM2 inactive or unbound).
+            if crate::input_method::commit_text(s, text) {
+                tracing::info!("Input method: {text}");
+                consume_latch(s);
+            } else {
+                for ch in text.chars() {
+                    emit_keysym(s, Keysym::from_char(ch));
+                }
+                consume_latch(s);
             }
-            consume_latch(s);
         }
         KeyAction::Unhandled(name) => {
             tracing::info!(action = %name, "tapped key with no wired action");
@@ -442,6 +462,28 @@ fn consume_latch(s: &mut MechanixKeyboardState) {
         s.virtual_keyboard_state.latched.clear();
         tracing::debug!("latched modifiers consumed");
     }
+}
+
+/// The insertable text a keysym produces, or `None` when it's a control key
+/// (BackSpace, Return, Tab, Escape, Delete, arrows, function keys, …) with no
+/// printable glyph. `keysym_get_name` returns the X11 *name* ("BackSpace"),
+/// which is not the character; `keysym_to_utf32` returns the produced code
+/// point, or `0` when the keysym yields no character at all. Control code
+/// points (C0/C1/DEL) are rejected so they never become a `commit_string` —
+/// such keys fall back to the virtual-keyboard-v1 keysym transport, which the
+/// compositor forwards as a real key event (so BackSpace deletes instead of
+/// typing "BackSpace"). Space (U+0020) is *not* a control char and commits
+/// normally.
+fn keysym_text(ks: Keysym) -> Option<String> {
+    let cps = xkb::keysym_to_utf32(ks);
+    if cps == 0 {
+        return None;
+    }
+    let ch = char::from_u32(cps)?;
+    if ch.is_control() {
+        return None;
+    }
+    Some(ch.to_string())
 }
 
 /// Send one keysym as a keycode down+up, holding the keystroke's modifiers around
@@ -563,5 +605,30 @@ mod tests {
         assert_eq!(one.mods, 0, "digit 1 should need no modifiers");
         assert_eq!(bang.code, one.code, "! must be the 1 key, shifted");
         assert_ne!(bang.mods, 0, "! must carry the Shift mask");
+    }
+
+    /// Control keysyms must not resolve to text — otherwise BackSpace would be
+    /// committed as the literal string "BackSpace" (its X11 name) instead of
+    /// deleting. They fall back to the virtual-keyboard-v1 keysym transport.
+    #[test]
+    fn control_keysyms_produce_no_text() {
+        // BackSpace, Return, Tab, Escape, Delete all yield a control code
+        // point (or none at all), so none should produce committable text.
+        let backspace = xkb::keysym_from_name("BackSpace", xkb::KEYSYM_NO_FLAGS);
+        let ret = xkb::keysym_from_name("Return", xkb::KEYSYM_NO_FLAGS);
+        let tab = xkb::keysym_from_name("Tab", xkb::KEYSYM_NO_FLAGS);
+        let esc = xkb::keysym_from_name("Escape", xkb::KEYSYM_NO_FLAGS);
+        let del = xkb::keysym_from_name("Delete", xkb::KEYSYM_NO_FLAGS);
+        assert_eq!(keysym_text(backspace), None, "BackSpace must not be text");
+        assert_eq!(keysym_text(ret), None, "Return must not be text");
+        assert_eq!(keysym_text(tab), None, "Tab must not be text");
+        assert_eq!(keysym_text(esc), None, "Escape must not be text");
+        assert_eq!(keysym_text(del), None, "Delete must not be text");
+
+        // Printable keysyms resolve to their character, not their X11 name.
+        assert_eq!(keysym_text(Keysym::from_char('q')), Some("q".into()));
+        assert_eq!(keysym_text(Keysym::from_char('Q')), Some("Q".into()));
+        assert_eq!(keysym_text(Keysym::from_char('!')), Some("!".into()));
+        assert_eq!(keysym_text(Keysym::from_char(' ')), Some(" ".into()));
     }
 }
